@@ -3,13 +3,28 @@ mod utils;
 
 pub use error::*;
 use sha2::{Digest, Sha256};
+use std::ffi::CString;
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
+use std::ptr;
+
+// TODO vmx 2021-02-25: Don't leak `size_t` outside of `opencl3`. This is needed for the
+// `cl_buffer_region` struct. There surely should be an abstraction.
+use cl3::memory::CL_MEM_READ_WRITE;
+use libc::{c_void, size_t};
+// TODO vmx 2021-02-25: Should there be a higher level abstraction in `opencl` like there is in
+// `ocl-core` (called `BufferRegion<T>`)
+use cl3::types::cl_buffer_region;
+// TODO vmx 2021-02-25: Don't use cl_sys directly, make sure `cl3` imports it. It seems that the
+// only possible value for the `buffer_create_type` is `CL_BUFFER_CREATE_REGION`, so perhaps the
+// `opencl3` `Buffer.create_sub_buffer()` might even just ignore that parameter and make `cl3`
+// to hard code `CL_BUFFER_CREATE_REGION`
+use cl_sys::CL_BUFFER_CREATE_TYPE_REGION;
 
 pub type BusId = u32;
 
 #[allow(non_camel_case_types)]
-pub type cl_device_id = ocl::ffi::cl_device_id;
+pub type cl_device_id = opencl3::types::cl_device_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Brand {
@@ -33,48 +48,65 @@ impl Brand {
 }
 
 pub struct Buffer<T> {
-    buffer: ocl::Buffer<u8>,
+    buffer: opencl3::memory::Buffer<u8>,
+    length: usize,
+    queue: opencl3::command_queue::CommandQueue,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T> Buffer<T> {
+    /// The number of bytes / size_of(T)
     pub fn length(&self) -> usize {
-        self.buffer.len() / std::mem::size_of::<T>()
+        self.length
     }
 
     pub fn write_from(&mut self, offset: usize, data: &[T]) -> GPUResult<()> {
         assert!(offset + data.len() <= self.length());
-        self.buffer
-            .create_sub_buffer(
-                None,
-                offset * std::mem::size_of::<T>(),
+
+        let buffer_create_info = cl_buffer_region {
+            origin: (offset * std::mem::size_of::<T>()) as size_t,
+            size: (data.len() * std::mem::size_of::<T>()) as size_t,
+        };
+        let buff = self.buffer.create_sub_buffer(
+            CL_MEM_READ_WRITE,
+            CL_BUFFER_CREATE_TYPE_REGION,
+            &buffer_create_info as *const _ as *const c_void,
+        )?;
+
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
                 data.len() * std::mem::size_of::<T>(),
-            )?
-            .write(unsafe {
-                std::slice::from_raw_parts(
-                    data.as_ptr() as *const T as *const u8,
-                    data.len() * std::mem::size_of::<T>(),
-                )
-            })
-            .enq()?;
+            )
+        };
+
+        self.queue
+            .enqueue_write_buffer(&buff, opencl3::types::CL_BLOCKING, 0, &data, &[])?;
+
         Ok(())
     }
 
     pub fn read_into(&self, offset: usize, data: &mut [T]) -> GPUResult<()> {
         assert!(offset + data.len() <= self.length());
-        self.buffer
-            .create_sub_buffer(
-                None,
-                offset * std::mem::size_of::<T>(),
+        let buffer_create_info = cl_buffer_region {
+            origin: (offset * std::mem::size_of::<T>()) as size_t,
+            size: (data.len() * std::mem::size_of::<T>()) as size_t,
+        };
+        let buff = self.buffer.create_sub_buffer(
+            CL_MEM_READ_WRITE,
+            CL_BUFFER_CREATE_TYPE_REGION,
+            &buffer_create_info as *const _ as *const c_void,
+        )?;
+
+        let mut data = unsafe {
+            std::slice::from_raw_parts_mut(
+                data.as_mut_ptr() as *mut T as *mut u8,
                 data.len() * std::mem::size_of::<T>(),
-            )?
-            .read(unsafe {
-                std::slice::from_raw_parts_mut(
-                    data.as_mut_ptr() as *mut T as *mut u8,
-                    data.len() * std::mem::size_of::<T>(),
-                )
-            })
-            .enq()?;
+            )
+        };
+        self.queue
+            .enqueue_read_buffer(&buff, opencl3::types::CL_BLOCKING, 0, &mut data, &[])?;
+
         Ok(())
     }
 }
@@ -85,8 +117,7 @@ pub struct Device {
     name: String,
     memory: u64,
     bus_id: Option<BusId>,
-    platform: ocl::Platform,
-    pub device: ocl::Device,
+    pub device: opencl3::device::Device,
 }
 
 impl Hash for Device {
@@ -114,7 +145,13 @@ impl Device {
         self.memory
     }
     pub fn is_little_endian(&self) -> GPUResult<bool> {
-        Ok(utils::is_little_endian(self.device)?)
+        match self.device.endian_little() {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(_) => Err(GPUError::DeviceInfoNotAvailable(
+                opencl3::device::DeviceInfo::CL_DEVICE_ENDIAN_LITTLE,
+            )),
+        }
     }
     pub fn bus_id(&self) -> Option<BusId> {
         self.bus_id
@@ -146,8 +183,8 @@ impl Device {
         utils::DEVICES.get(&brand)
     }
 
-    pub fn cl_device_id(&self) -> ocl::ffi::cl_device_id {
-        self.device.as_core().as_raw()
+    pub fn cl_device_id(&self) -> cl_device_id {
+        self.device.id()
     }
 }
 
@@ -198,19 +235,16 @@ fn get_device_by_index(index: usize) -> Option<&'static Device> {
     Device::all_iter().nth(index)
 }
 
-pub fn get_memory(d: ocl::Device) -> GPUResult<u64> {
-    match d.info(ocl::enums::DeviceInfo::GlobalMemSize)? {
-        ocl::enums::DeviceInfoResult::GlobalMemSize(sz) => Ok(sz),
-        _ => Err(GPUError::DeviceInfoNotAvailable(
-            ocl::enums::DeviceInfo::GlobalMemSize,
-        )),
-    }
+// TODO vmx 2021-02-26: Move to utils and re-export as here as public export
+pub fn get_memory(d: &opencl3::device::Device) -> GPUResult<u64> {
+    d.global_mem_size().map_err(|_| {
+        GPUError::DeviceInfoNotAvailable(opencl3::device::DeviceInfo::CL_DEVICE_GLOBAL_MEM_SIZE)
+    })
 }
 
 pub struct Program {
     device: Device,
-    program: ocl::Program,
-    queue: ocl::Queue,
+    context: opencl3::context::Context,
 }
 
 impl Program {
@@ -223,59 +257,47 @@ impl Program {
             let bin = std::fs::read(cached)?;
             Program::from_binary(device, bin)
         } else {
-            let context = ocl::Context::builder()
-                .platform(device.platform)
-                .devices(device.device)
-                .build()?;
-            let program = ocl::Program::builder()
-                .src(src)
-                .devices(ocl::builders::DeviceSpecifier::Single(device.device))
-                .build(&context)?;
-            let queue = ocl::Queue::new(&context, device.device, None)?;
-            let prog = Program {
-                program,
-                queue,
-                device,
-            };
+            let mut context = opencl3::context::Context::from_device(device.device)?;
+            let options = CString::default();
+            let src_cstring = CString::new(src).expect("Program source contains a null byte");
+            context.build_program_from_source(&src_cstring, &options)?;
+            context.create_command_queues(0)?;
+            let prog = Program { device, context };
             std::fs::write(cached, prog.to_binary()?)?;
             Ok(prog)
         }
     }
     pub fn from_binary(device: Device, bin: Vec<u8>) -> GPUResult<Program> {
-        let context = ocl::Context::builder()
-            .platform(device.platform)
-            .devices(device.device)
-            .build()?;
+        let mut context = opencl3::context::Context::from_device(device.device)?;
         let bins = vec![&bin[..]];
-        let program = ocl::Program::builder()
-            .binaries(&bins)
-            .devices(ocl::builders::DeviceSpecifier::Single(device.device))
-            .build(&context)?;
-        let queue = ocl::Queue::new(&context, device.device, None)?;
-        Ok(Program {
-            device,
-            program,
-            queue,
-        })
+        let options = CString::default();
+        context.build_program_from_binary(&bins, &options)?;
+        context.create_command_queues(0)?;
+        Ok(Program { device, context })
     }
     pub fn to_binary(&self) -> GPUResult<Vec<u8>> {
-        match self.program.info(ocl::enums::ProgramInfo::Binaries)? {
-            ocl::enums::ProgramInfoResult::Binaries(bins) => Ok(bins[0].clone()),
-            _ => Err(GPUError::ProgramInfoNotAvailable(
-                ocl::enums::ProgramInfo::Binaries,
+        match self.context.programs()[0].get_binaries() {
+            Ok(bins) => Ok(bins[0].clone()),
+            Err(_) => Err(GPUError::ProgramInfoNotAvailable(
+                opencl3::program::ProgramInfo::CL_PROGRAM_BINARIES,
             )),
         }
     }
     pub fn create_buffer<T>(&self, length: usize) -> GPUResult<Buffer<T>> {
         assert!(length > 0);
-        let buff = ocl::Buffer::<u8>::builder()
-            .queue(self.queue.clone())
-            .flags(ocl::MemFlags::new().read_write())
-            .len(length * std::mem::size_of::<T>())
-            .build()?;
-        buff.write(&vec![0u8]).enq()?;
+        let buff = opencl3::memory::Buffer::create(
+            &self.context,
+            opencl3::memory::CL_MEM_READ_WRITE,
+            length,
+            ptr::null_mut(),
+        )?;
+        let queue = self.context.default_queue();
+        queue.enqueue_write_buffer(&buff, opencl3::types::CL_BLOCKING, 0, &vec![0u8], &[])?;
+
         Ok(Buffer::<T> {
             buffer: buff,
+            length,
+            queue: queue.clone(),
             _phantom: std::marker::PhantomData,
         })
     }
@@ -295,20 +317,23 @@ impl Program {
         }
         self.create_buffer::<T>(n)
     }
-    pub fn create_kernel(&self, name: &str, gws: usize, lws: Option<usize>) -> Kernel<'_> {
-        let mut builder = ocl::Kernel::builder();
-        builder.name(name);
-        builder.program(&self.program);
-        builder.queue(self.queue.clone());
-        builder.global_work_size([gws]);
+    pub fn create_kernel(&self, name: &str, gws: usize, lws: Option<usize>) -> Kernel {
+        // TODO vmx 2021-03-01: Replace `unwrap()` with proper error handling
+        let kernel = self
+            .context
+            .get_kernel(&CString::new(name).expect("Kernel name contains a null byte"))
+            .unwrap();
+        let mut builder = opencl3::kernel::ExecuteKernel::new(kernel);
+        builder.set_global_work_size(gws);
         if let Some(lws) = lws {
-            builder.local_work_size([lws]);
+            builder.set_local_work_size(lws);
         }
-        Kernel::<'_> { builder }
+        Kernel {
+            builder,
+            queue: self.context.default_queue(),
+        }
     }
 }
-
-pub use ocl::OclPrm as Parameter;
 
 pub trait KernelArgument<'a> {
     fn push(&self, kernel: &mut Kernel<'a>);
@@ -316,13 +341,13 @@ pub trait KernelArgument<'a> {
 
 impl<'a, T> KernelArgument<'a> for &'a Buffer<T> {
     fn push(&self, kernel: &mut Kernel<'a>) {
-        kernel.builder.arg(&self.buffer);
+        kernel.builder.set_arg(&self.buffer);
     }
 }
 
-impl<T: ocl::OclPrm> KernelArgument<'_> for T {
+impl KernelArgument<'_> for u32 {
     fn push(&self, kernel: &mut Kernel) {
-        kernel.builder.arg(self.clone());
+        kernel.builder.set_arg(self);
     }
 }
 
@@ -343,13 +368,15 @@ impl<T> KernelArgument<'_> for LocalBuffer<T> {
     fn push(&self, kernel: &mut Kernel) {
         kernel
             .builder
-            .arg_local::<u8>(self.length * std::mem::size_of::<T>());
+            .set_arg_local_buffer(self.length * std::mem::size_of::<T>())
+            .unwrap();
     }
 }
 
 #[derive(Debug)]
 pub struct Kernel<'a> {
-    builder: ocl::builders::KernelBuilder<'a>,
+    builder: opencl3::kernel::ExecuteKernel<'a>,
+    queue: &'a opencl3::command_queue::CommandQueue,
 }
 
 impl<'a> Kernel<'a> {
@@ -357,11 +384,8 @@ impl<'a> Kernel<'a> {
         t.push(&mut self);
         self
     }
-    pub fn run(self) -> GPUResult<()> {
-        let kern = self.builder.build()?;
-        unsafe {
-            kern.enq()?;
-        }
+    pub fn run(mut self) -> GPUResult<()> {
+        self.builder.enqueue_nd_range(&self.queue)?;
         Ok(())
     }
 }

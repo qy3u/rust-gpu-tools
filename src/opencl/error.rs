@@ -1,30 +1,26 @@
-use ocl;
+use opencl3::{device::DeviceInfo, program::ProgramInfo, types::cl_int};
 
 #[derive(thiserror::Error, Debug)]
 pub enum GPUError {
-    #[error("Ocl Error: {0}")]
-    Ocl(ocl::Error),
+    #[error("Opencl3 Error: {0}")]
+    Opencl3(cl_int),
     #[error("Device not found!")]
     DeviceNotFound,
     #[error("Device info not available!")]
-    DeviceInfoNotAvailable(ocl::enums::DeviceInfo),
+    DeviceInfoNotAvailable(DeviceInfo),
     #[error("Program info not available!")]
-    ProgramInfoNotAvailable(ocl::enums::ProgramInfo),
+    ProgramInfoNotAvailable(ProgramInfo),
     #[error("IO Error: {0}")]
     IO(#[from] std::io::Error),
+    #[error("Cannot get bus ID for device with vendor {0}")]
+    DeviceBusId(String),
 }
 
 #[allow(dead_code)]
 pub type GPUResult<T> = std::result::Result<T, GPUError>;
 
-impl From<ocl::Error> for GPUError {
-    fn from(error: ocl::Error) -> Self {
-        GPUError::Ocl(error)
-    }
-}
-
-impl From<ocl::core::Error> for GPUError {
-    fn from(error: ocl::core::Error) -> Self {
-        GPUError::Ocl(error.into())
+impl From<cl_int> for GPUError {
+    fn from(error: cl_int) -> Self {
+        GPUError::Opencl3(error)
     }
 }

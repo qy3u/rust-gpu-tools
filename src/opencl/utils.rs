@@ -1,8 +1,16 @@
 use std::collections::HashMap;
-use std::convert::TryInto;
 
+use cl3::{api_info_value, api_info_vector};
 use lazy_static::lazy_static;
 use log::{debug, warn};
+use opencl3::error_codes::CL_SUCCESS;
+use opencl3::types::{cl_int, cl_uint};
+// TODO vmx 2021-02-26: Don't use cl_sys directly, but implement it in opecl3/cl3
+use cl_sys::clGetDeviceInfo;
+// TODO vmx 2021-02-26: This is needed for the `api_info_value` macro. Change the macro itself
+// to use `std::mem` instead of `mem`. This won't be needed in case that `api_info_value`
+// invocation gets directly implemented in `cl3`
+use std::mem;
 
 use super::*;
 
@@ -19,37 +27,37 @@ struct cl_amd_device_topology {
 const AMD_DEVICE_VENDOR_STRING: &'static str = "AMD";
 const NVIDIA_DEVICE_VENDOR_STRING: &'static str = "NVIDIA Corporation";
 
-pub fn is_little_endian(d: ocl::Device) -> GPUResult<bool> {
-    match d.info(ocl::enums::DeviceInfo::EndianLittle)? {
-        ocl::enums::DeviceInfoResult::EndianLittle(b) => Ok(b),
-        _ => Err(GPUError::DeviceInfoNotAvailable(
-            ocl::enums::DeviceInfo::EndianLittle,
+// Creates a new function called `get_device_info_bus_id` which takes two arguments, the device
+// and the parameter ID.
+api_info_value!(get_device_info_uint, cl_uint, clGetDeviceInfo);
+
+// NOTE vmx 2021-02-26: This is the same as the `get_string` in `cl3/src/devices.rs`
+api_info_vector!(get_device_info_bytes, u8, clGetDeviceInfo);
+
+pub fn get_bus_id(d: &opencl3::device::Device) -> Result<u32, GPUError> {
+    let vendor = d.vendor()?;
+    match vendor.to_str() {
+        Ok(AMD_DEVICE_VENDOR_STRING) => get_amd_bus_id(d).map_err(Into::into),
+        Ok(NVIDIA_DEVICE_VENDOR_STRING) => get_nvidia_bus_id(d).map_err(Into::into),
+        _ => Err(GPUError::DeviceBusId(
+            vendor
+                .to_str()
+                .expect("Vendor is a valid UTF-8")
+                .to_string(),
         )),
     }
 }
 
-pub fn get_bus_id(d: ocl::Device) -> ocl::Result<u32> {
-    let vendor = d.vendor()?;
-    match vendor.as_str() {
-        AMD_DEVICE_VENDOR_STRING => get_amd_bus_id(d),
-        NVIDIA_DEVICE_VENDOR_STRING => get_nvidia_bus_id(d),
-        _ => Err(ocl::Error::from(format!(
-            "cannot get bus ID for device with vendor {} ",
-            vendor
-        ))),
-    }
-}
-
-pub fn get_nvidia_bus_id(d: ocl::Device) -> ocl::Result<u32> {
+pub fn get_nvidia_bus_id(d: &opencl3::device::Device) -> Result<u32, cl_int> {
     const CL_DEVICE_PCI_BUS_ID_NV: u32 = 0x4008;
-    let result = d.info_raw(CL_DEVICE_PCI_BUS_ID_NV)?;
-    Ok(u32::from_le_bytes(result[..].try_into().unwrap()))
+    let result = get_device_info_uint(d.id(), CL_DEVICE_PCI_BUS_ID_NV.into())?;
+    Ok(result)
 }
 
-pub fn get_amd_bus_id(d: ocl::Device) -> ocl::Result<u32> {
+pub fn get_amd_bus_id(d: &opencl3::device::Device) -> Result<u32, cl_int> {
     const CL_DEVICE_TOPOLOGY_AMD: u32 = 0x4037;
-    let result = d.info_raw(CL_DEVICE_TOPOLOGY_AMD)?;
     let size = std::mem::size_of::<cl_amd_device_topology>();
+    let result = get_device_info_bytes(d.id(), CL_DEVICE_TOPOLOGY_AMD, size)?;
     assert_eq!(result.len(), size);
     let mut topo = cl_amd_device_topology::default();
     unsafe {
@@ -85,13 +93,17 @@ pub fn cache_path(device: &Device, cl_source: &str) -> std::io::Result<std::path
 }
 
 lazy_static! {
-    pub static ref PLATFORMS: Vec<ocl::Platform> = ocl::Platform::list().unwrap_or_default();
+    pub static ref PLATFORMS: Vec<opencl3::platform::Platform> =
+        opencl3::platform::get_platforms().unwrap_or_default();
     pub static ref DEVICES: HashMap<Brand, Vec<Device>> = build_device_list();
 }
 
-pub fn find_platform(platform_name: &str) -> ocl::Result<Option<&ocl::Platform>> {
+pub fn find_platform(platform_name: &str) -> Result<Option<&opencl3::platform::Platform>, cl_int> {
     let platform = PLATFORMS.iter().find(|&p| match p.clone().name() {
-        Ok(p) => p == platform_name.to_string(),
+        Ok(p) => {
+            p == CString::new(platform_name.to_string())
+                .expect("Platform string contains null byte")
+        }
         Err(_) => false,
     });
     Ok(platform)
@@ -104,18 +116,23 @@ fn build_device_list() -> HashMap<Brand, Vec<Device>> {
     for brand in brands.into_iter() {
         match find_platform(brand.platform_name()) {
             Ok(Some(platform)) => {
-                let devices = ocl::Device::list(platform, Some(ocl::core::DeviceType::GPU))
+                let devices = platform
+                    .get_devices(opencl3::device::CL_DEVICE_TYPE_CPU)
                     .map_err(Into::into)
                     .and_then(|devices| {
                         devices
                             .into_iter()
+                            .map(opencl3::device::Device::new)
                             .filter(|d| {
                                 if let Ok(vendor) = d.vendor() {
-                                    match vendor.as_str() {
+                                    match vendor
+                                        .to_str()
+                                        .expect("Vendor string contains invalid UTF-8")
+                                    {
                                         // Only use devices from the accepted vendors ...
                                         AMD_DEVICE_VENDOR_STRING | NVIDIA_DEVICE_VENDOR_STRING => {
                                             // ... which are available.
-                                            return d.is_available().unwrap_or(false);
+                                            return d.available().unwrap_or(0) != 0;
                                         }
                                         _ => (),
                                     }
@@ -125,10 +142,12 @@ fn build_device_list() -> HashMap<Brand, Vec<Device>> {
                             .map(|d| -> GPUResult<_> {
                                 Ok(Device {
                                     brand,
-                                    name: d.name()?,
-                                    memory: get_memory(d)?,
-                                    bus_id: utils::get_bus_id(d).ok(),
-                                    platform: *platform,
+                                    name: d
+                                        .name()?
+                                        .into_string()
+                                        .expect("Device name contains invalud UTF-8"),
+                                    memory: get_memory(&d)?,
+                                    bus_id: utils::get_bus_id(&d).ok(),
                                     device: d,
                                 })
                             })
