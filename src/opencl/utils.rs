@@ -117,7 +117,7 @@ fn build_device_list() -> HashMap<Brand, Vec<Device>> {
         match find_platform(brand.platform_name()) {
             Ok(Some(platform)) => {
                 let devices = platform
-                    .get_devices(opencl3::device::CL_DEVICE_TYPE_CPU)
+                    .get_devices(opencl3::device::CL_DEVICE_TYPE_GPU)
                     .map_err(Into::into)
                     .and_then(|devices| {
                         devices
