@@ -288,7 +288,11 @@ impl Program {
         let buff = opencl3::memory::Buffer::create(
             &self.context,
             opencl3::memory::CL_MEM_READ_WRITE,
-            length,
+            // TODO vmx 2021-03-15: multiplying with the memsize of the type seems to be wrong.
+            // The `opencl3::memory::Buffer::create()` takes the number of elements and does
+            // internally multiply with the memsize of the given test. Though `ocl` seems to do
+            // the same thing, doing this multiplication makes the tests pass.
+            length * std::mem::size_of::<T>(),
             ptr::null_mut(),
         )?;
         let queue = self.context.default_queue();
