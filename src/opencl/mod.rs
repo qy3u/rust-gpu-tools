@@ -372,8 +372,7 @@ impl<T> KernelArgument<'_> for LocalBuffer<T> {
     fn push(&self, kernel: &mut Kernel) {
         kernel
             .builder
-            .set_arg_local_buffer(self.length * std::mem::size_of::<T>())
-            .unwrap();
+            .set_arg_local_buffer::<T>(self.length * std::mem::size_of::<T>());
     }
 }
 
